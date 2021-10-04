@@ -63,7 +63,7 @@ func startReaderDrain(wg *sync.WaitGroup, readerLogger *logrus.Entry, reader io.
 	}()
 }
 
-func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, passthroughLogs bool) error {
+func runJob(cmdCtx context.Context, cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, passthroughLogs bool) error {
 	jobLogger.Info("starting")
 
 	cmd := exec.Command(cronCtx.Shell, "-c", command)
@@ -71,6 +71,17 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 	// Run in a separate process group so that in interactive usage, CTRL+C
 	// stops supercronic, not the children threads.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	go func() {
+		// Kill command and its subprocesses when command is canceled.
+		// Do nothing if command has already finished, in this case
+		// syscall.Getpgid returns error.
+		<-cmdCtx.Done()
+		pgid, err := syscall.Getpgid(cmd.Process.Pid)
+		if err == nil {
+			syscall.Kill(-pgid, syscall.SIGKILL)
+		}
+	}()
 
 	env := os.Environ()
 	for k, v := range cronCtx.Environ {
@@ -122,7 +133,7 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 	return nil
 }
 
-func monitorJob(ctx context.Context, job *crontab.Job, t0 time.Time, jobLogger *logrus.Entry, overlapping bool, promMetrics *prometheus_metrics.PrometheusMetrics) {
+func monitorJob(ctx context.Context, job *crontab.Job, t0 time.Time, jobLogger *logrus.Entry, overlapping bool, replacing bool, promMetrics *prometheus_metrics.PrometheusMetrics) {
 	t := t0
 
 	for {
@@ -133,6 +144,9 @@ func monitorJob(ctx context.Context, job *crontab.Job, t0 time.Time, jobLogger *
 			m := "not starting"
 			if overlapping {
 				m = "overlapping jobs"
+			}
+			if replacing {
+				m = "replacing job"
 			}
 
 			jobLogger.Warnf("%s: job is still running since %s (%s elapsed)", m, t0, t.Sub(t0))
@@ -149,9 +163,10 @@ func startFunc(
 	exitCtx context.Context,
 	logger *logrus.Entry,
 	overlapping bool,
+	replacing bool,
 	expression crontab.Expression,
 	timezone *time.Location,
-	fn func(time.Time, *logrus.Entry),
+	fn func(context.Context, time.Time, *logrus.Entry),
 ) {
 	wg.Add(1)
 
@@ -160,6 +175,8 @@ func startFunc(
 
 		var jobWg sync.WaitGroup
 		defer jobWg.Wait()
+
+		var cancelPreviousJob func()
 
 		var cronIteration uint64
 		nextRun := time.Now().In(timezone)
@@ -189,21 +206,30 @@ func startFunc(
 
 			jobWg.Add(1)
 
+			cmdCtx, cancel := context.WithCancel(context.Background())
+
 			// `nextRun` will be mutated by the next iteration of
 			// this loop, so we cannot simply capture it into the
 			// closure here. Instead, we make it a parameter so
 			// that it gets copied when `runThisJob` is called
 			runThisJob := func(cronIteration uint64, nextRun time.Time) {
 				defer jobWg.Done()
+				defer cancel()
 
 				jobLogger := logger.WithFields(logrus.Fields{
 					"iteration": cronIteration,
 				})
 
-				fn(nextRun, jobLogger)
+				fn(cmdCtx, nextRun, jobLogger)
 			}
 
-			if overlapping {
+			if replacing {
+				if cancelPreviousJob != nil {
+					cancelPreviousJob()
+				}
+				go runThisJob(cronIteration, nextRun)
+				cancelPreviousJob = cancel
+			} else if overlapping {
 				go runThisJob(cronIteration, nextRun)
 			} else {
 				runThisJob(cronIteration, nextRun)
@@ -221,10 +247,11 @@ func StartJob(
 	exitCtx context.Context,
 	cronLogger *logrus.Entry,
 	overlapping bool,
+	replacing bool,
 	passthroughLogs bool,
 	promMetrics *prometheus_metrics.PrometheusMetrics,
 ) {
-	runThisJob := func(t0 time.Time, jobLogger *logrus.Entry) {
+	runThisJob := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
 		promMetrics.CronsCurrentlyRunningGauge.With(jobPromLabels(job)).Inc()
 
 		defer func() {
@@ -234,7 +261,7 @@ func StartJob(
 		monitorCtx, cancelMonitor := context.WithCancel(context.Background())
 		defer cancelMonitor()
 
-		go monitorJob(monitorCtx, job, t0, jobLogger, overlapping, promMetrics)
+		go monitorJob(monitorCtx, job, t0, jobLogger, overlapping, replacing, promMetrics)
 
 		timer := prometheus.NewTimer(prometheus.ObserverFunc(func(v float64) {
 			promMetrics.CronsExecutionTimeHistogram.With(jobPromLabels(job)).Observe(v)
@@ -242,7 +269,7 @@ func StartJob(
 
 		defer timer.ObserveDuration()
 
-		err := runJob(cronCtx, job.Command, jobLogger, passthroughLogs)
+		err := runJob(cmdCtx, cronCtx, job.Command, jobLogger, passthroughLogs)
 
 		promMetrics.CronsExecCounter.With(jobPromLabels(job)).Inc()
 
@@ -262,6 +289,7 @@ func StartJob(
 		exitCtx,
 		cronLogger,
 		overlapping,
+		replacing,
 		job.Expression,
 		cronCtx.Timezone,
 		runThisJob,

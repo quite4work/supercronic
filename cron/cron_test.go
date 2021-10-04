@@ -150,7 +150,9 @@ func TestRunJob(t *testing.T) {
 		label := fmt.Sprintf("RunJob(%q)", tt.command)
 		logger, channel := newTestLogger()
 
-		err := runJob(tt.context, tt.command, logger, false)
+		cmdCtx, cancel := context.WithCancel(context.Background())
+		err := runJob(cmdCtx, tt.context, tt.command, logger, false)
+		cancel()
 		if tt.success {
 			assert.Nil(t, err, label)
 		} else {
@@ -198,7 +200,7 @@ func TestStartJobExitsOnRequest(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	StartJob(&wg, &basicContext, &job, ctx, logger, false, false, &PROM_METRICS)
+	StartJob(&wg, &basicContext, &job, ctx, logger, false, false, false, &PROM_METRICS)
 
 	wg.Wait()
 }
@@ -218,7 +220,7 @@ func TestStartJobRunsJob(t *testing.T) {
 
 	logger, channel := newTestLogger()
 
-	StartJob(&wg, &basicContext, &job, ctx, logger, false, false, &PROM_METRICS)
+	StartJob(&wg, &basicContext, &job, ctx, logger, false, false, false, &PROM_METRICS)
 
 	select {
 	case entry := <-channel:
@@ -281,12 +283,12 @@ func TestStartFuncWaitsForCompletion(t *testing.T) {
 	ctxStep1, step1Done := context.WithCancel(context.Background())
 	ctxStep2, step2Done := context.WithCancel(context.Background())
 
-	testFn := func(t0 time.Time, jobLogger *logrus.Entry) {
+	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
 		step1Done()
 		<-ctxStep2.Done()
 	}
 
-	startFunc(&wg, ctxStartFunc, logger, false, expr, time.Local, testFn)
+	startFunc(&wg, ctxStartFunc, logger, false, false, expr, time.Local, testFn)
 	go func() {
 		wg.Wait()
 		allDone()
@@ -329,12 +331,12 @@ func TestStartFuncDoesNotRunOverlappingJobs(t *testing.T) {
 	ctxStartFunc, cancelStartFunc := context.WithCancel(context.Background())
 	ctxAllDone, allDone := context.WithCancel(context.Background())
 
-	testFn := func(t0 time.Time, jobLogger *logrus.Entry) {
+	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
 		testChan <- nil
 		<-ctxAllDone.Done()
 	}
 
-	startFunc(&wg, ctxStartFunc, logger, false, expr, time.Local, testFn)
+	startFunc(&wg, ctxStartFunc, logger, false, false, expr, time.Local, testFn)
 
 	select {
 	case <-testChan:
@@ -368,12 +370,12 @@ func TestStartFuncRunsOverlappingJobs(t *testing.T) {
 	ctxStartFunc, cancelStartFunc := context.WithCancel(context.Background())
 	ctxAllDone, allDone := context.WithCancel(context.Background())
 
-	testFn := func(t0 time.Time, jobLogger *logrus.Entry) {
+	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
 		testChan <- nil
 		<-ctxAllDone.Done()
 	}
 
-	startFunc(&wg, ctxStartFunc, logger, true, expr, time.Local, testFn)
+	startFunc(&wg, ctxStartFunc, logger, true, false, expr, time.Local, testFn)
 
 	for i := 0; i < 5; i++ {
 		select {
@@ -406,7 +408,7 @@ func TestStartFuncUsesTz(t *testing.T) {
 
 	it := 0
 
-	testFn := func(t0 time.Time, jobLogger *logrus.Entry) {
+	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
 		testChan <- t0.Location()
 		it += 1
 
@@ -422,7 +424,7 @@ func TestStartFuncUsesTz(t *testing.T) {
 		}
 	}
 
-	startFunc(&wg, ctxStartFunc, logger, false, expr, loc, testFn)
+	startFunc(&wg, ctxStartFunc, logger, false, false, expr, loc, testFn)
 
 	for i := 0; i < 5; i++ {
 		select {
