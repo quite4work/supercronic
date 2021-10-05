@@ -150,9 +150,8 @@ func TestRunJob(t *testing.T) {
 		label := fmt.Sprintf("RunJob(%q)", tt.command)
 		logger, channel := newTestLogger()
 
-		cmdCtx, cancel := context.WithCancel(context.Background())
+		cmdCtx := context.Background()
 		err := runJob(cmdCtx, tt.context, tt.command, logger, false)
-		cancel()
 		if tt.success {
 			assert.Nil(t, err, label)
 		} else {
@@ -382,6 +381,51 @@ func TestStartFuncRunsOverlappingJobs(t *testing.T) {
 		case <-testChan:
 		case <-time.After(time.Second):
 			t.Fatalf("fn instances did not overlap")
+		}
+	}
+
+	cancelStartFunc()
+	allDone()
+
+	wg.Wait()
+}
+
+func TestStartFuncRunsReplacingJobs(t *testing.T) {
+	// We kick off a bunch of functions that never terminate, and expect to
+	// see that jobs are replaced sequentially.
+
+	expr := &testExpression{10 * time.Millisecond}
+
+	testChan := make(chan int, TEST_CHANNEL_BUFFER_SIZE)
+	iterChan := make(chan int, TEST_CHANNEL_BUFFER_SIZE)
+	iterChan <- -1
+
+	var wg sync.WaitGroup
+	logger, _ := newTestLogger()
+
+	ctxStartFunc, cancelStartFunc := context.WithCancel(context.Background())
+	ctxAllDone, allDone := context.WithCancel(context.Background())
+
+	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
+		iteration := <-iterChan
+		select {
+		case <-cmdCtx.Done():
+			iterChan <- iteration + 1
+			testChan <- iteration + 1
+		case <-ctxAllDone.Done():
+		}
+	}
+
+	startFunc(&wg, ctxStartFunc, logger, false, true, expr, time.Local, testFn)
+
+	for i := 0; i < 5; i++ {
+		select {
+		case iteration := <-testChan:
+			if iteration != i {
+				t.Fatalf("fn instances are not replaced sequentially")
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("fn instances were not replaced")
 		}
 	}
 
