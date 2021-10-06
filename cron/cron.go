@@ -72,14 +72,14 @@ func runJob(cmdCtx context.Context, cronCtx *crontab.Context, command string, jo
 	// stops supercronic, not the children threads.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	cmdDone := make(chan interface{})
 	go func() {
+		select {
 		// Kill command and its subprocesses when command is canceled.
-		// Do nothing if command has already finished, in this case
-		// syscall.Getpgid returns error.
-		<-cmdCtx.Done()
-		pgid, err := syscall.Getpgid(cmd.Process.Pid)
-		if err == nil {
-			syscall.Kill(-pgid, syscall.SIGKILL)
+		case <-cmdCtx.Done():
+			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// Do nothing if command has already finished.
+		case <-cmdDone:
 		}
 	}()
 
@@ -126,11 +126,13 @@ func runJob(cmdCtx context.Context, cronCtx *crontab.Context, command string, jo
 
 	wg.Wait()
 
+	var res error = nil
 	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("error running command: %v", err)
+		res = fmt.Errorf("error running command: %v", err)
 	}
 
-	return nil
+	cmdDone <- nil
+	return res
 }
 
 func monitorJob(ctx context.Context, job *crontab.Job, t0 time.Time, jobLogger *logrus.Entry, overlapping bool, replacing bool, promMetrics *prometheus_metrics.PrometheusMetrics) {
