@@ -101,6 +101,24 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 		return err
 	}
 
+	if replacing {
+		cmdDoneCh := make(chan struct{})
+		var pid int = cmd.Process.Pid
+		go func() {
+			select {
+			// Kill command and its subprocesses when command is canceled.
+			case <-time.After(time.Until(nextRun)):
+				syscall.Kill(-pid, syscall.SIGKILL)
+				<-cmdDoneCh
+			// Do nothing if command has already finished.
+			case <-cmdDoneCh:
+			}
+		}()
+		defer func() {
+			cmdDoneCh <- struct{}{}
+		}()
+	}
+
 	var wg sync.WaitGroup
 
 	if stdout != nil {
@@ -113,34 +131,13 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 		startReaderDrain(&wg, stderrLogger, stderr)
 	}
 
-	done := make(chan error, 1)
-	go func() {
-		wg.Wait()
-		done <- cmd.Wait()
-	}()
+	wg.Wait()
 
-	var res error = nil
-	if replacing {
-		cmdPid := cmd.Process.Pid
-		select {
-		case res = <-done:
-		case <-time.After(time.Until(nextRun)):
-			err := syscall.Kill(-cmdPid, syscall.SIGKILL)
-			res = cmd.Wait()
-			if err != nil {
-				return fmt.Errorf("failed to replace job: %v", err)
-			}
-			return fmt.Errorf("job is replaced: %v", res)
+	if err := cmd.Wait(); err != nil {
+		return fmt.Errorf("error running command: %v", err)
+	}
 
-		}
-	} else {
-		res = <-done
-	}
-	if res != nil {
-		return fmt.Errorf("error running command: %v", res)
-	} else {
-		return nil
-	}
+	return nil
 }
 
 func monitorJob(ctx context.Context, job *crontab.Job, t0 time.Time, jobLogger *logrus.Entry, overlapping bool, replacing bool, promMetrics *prometheus_metrics.PrometheusMetrics) {
