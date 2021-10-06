@@ -63,7 +63,7 @@ func startReaderDrain(wg *sync.WaitGroup, readerLogger *logrus.Entry, reader io.
 	}()
 }
 
-func runJob(cmdCtx context.Context, cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, passthroughLogs bool) error {
+func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, passthroughLogs bool, nextRun time.Time, replacing bool) error {
 	jobLogger.Info("starting")
 
 	cmd := exec.Command(cronCtx.Shell, "-c", command)
@@ -72,16 +72,19 @@ func runJob(cmdCtx context.Context, cronCtx *crontab.Context, command string, jo
 	// stops supercronic, not the children threads.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	cmdDone := make(chan interface{})
-	go func() {
-		select {
-		// Kill command and its subprocesses when command is canceled.
-		case <-cmdCtx.Done():
-			syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		// Do nothing if command has already finished.
-		case <-cmdDone:
-		}
-	}()
+	var cmdDoneCh chan interface{} = nil
+	if replacing {
+		cmdDoneCh = make(chan interface{})
+		go func() {
+			select {
+			// Kill command and its subprocesses when command is canceled.
+			case <-time.After(time.Until(nextRun)):
+				syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			// Do nothing if command has already finished.
+			case <-cmdDoneCh:
+			}
+		}()
+	}
 
 	env := os.Environ()
 	for k, v := range cronCtx.Environ {
@@ -131,7 +134,10 @@ func runJob(cmdCtx context.Context, cronCtx *crontab.Context, command string, jo
 		res = fmt.Errorf("error running command: %v", err)
 	}
 
-	cmdDone <- nil
+	if replacing {
+		cmdDoneCh <- nil
+	}
+
 	return res
 }
 
@@ -168,7 +174,7 @@ func startFunc(
 	replacing bool,
 	expression crontab.Expression,
 	timezone *time.Location,
-	fn func(context.Context, time.Time, *logrus.Entry),
+	fn func(time.Time, *logrus.Entry, bool),
 ) {
 	wg.Add(1)
 
@@ -206,11 +212,6 @@ func startFunc(
 
 			jobWg.Add(1)
 
-			var cmdCtx context.Context = nil
-			if replacing {
-				cmdCtx, _ = context.WithDeadline(context.Background(), expression.Next(nextRun))
-			}
-
 			// `nextRun` will be mutated by the next iteration of
 			// this loop, so we cannot simply capture it into the
 			// closure here. Instead, we make it a parameter so
@@ -222,7 +223,7 @@ func startFunc(
 					"iteration": cronIteration,
 				})
 
-				fn(cmdCtx, nextRun, jobLogger)
+				fn(nextRun, jobLogger, replacing)
 			}
 
 			if overlapping || replacing {
@@ -247,7 +248,7 @@ func StartJob(
 	passthroughLogs bool,
 	promMetrics *prometheus_metrics.PrometheusMetrics,
 ) {
-	runThisJob := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
+	runThisJob := func(t0 time.Time, jobLogger *logrus.Entry, replacing bool) {
 		promMetrics.CronsCurrentlyRunningGauge.With(jobPromLabels(job)).Inc()
 
 		defer func() {
@@ -265,7 +266,8 @@ func StartJob(
 
 		defer timer.ObserveDuration()
 
-		err := runJob(cmdCtx, cronCtx, job.Command, jobLogger, passthroughLogs)
+		nextRun := job.Expression.Next(t0)
+		err := runJob(cronCtx, job.Command, jobLogger, passthroughLogs, nextRun, replacing)
 
 		promMetrics.CronsExecCounter.With(jobPromLabels(job)).Inc()
 
