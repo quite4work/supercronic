@@ -178,8 +178,6 @@ func startFunc(
 		var jobWg sync.WaitGroup
 		defer jobWg.Wait()
 
-		var cancelPreviousJob func()
-
 		var cronIteration uint64
 		nextRun := time.Now().In(timezone)
 
@@ -208,7 +206,10 @@ func startFunc(
 
 			jobWg.Add(1)
 
-			cmdCtx, cancel := context.WithCancel(context.Background())
+			var cmdCtx context.Context = nil
+			if replacing {
+				cmdCtx, _ = context.WithDeadline(context.Background(), expression.Next(nextRun))
+			}
 
 			// `nextRun` will be mutated by the next iteration of
 			// this loop, so we cannot simply capture it into the
@@ -216,7 +217,6 @@ func startFunc(
 			// that it gets copied when `runThisJob` is called
 			runThisJob := func(cronIteration uint64, nextRun time.Time) {
 				defer jobWg.Done()
-				defer cancel()
 
 				jobLogger := logger.WithFields(logrus.Fields{
 					"iteration": cronIteration,
@@ -225,13 +225,7 @@ func startFunc(
 				fn(cmdCtx, nextRun, jobLogger)
 			}
 
-			if replacing {
-				if cancelPreviousJob != nil {
-					cancelPreviousJob()
-				}
-				go runThisJob(cronIteration, nextRun)
-				cancelPreviousJob = cancel
-			} else if overlapping {
+			if overlapping || replacing {
 				go runThisJob(cronIteration, nextRun)
 			} else {
 				runThisJob(cronIteration, nextRun)
