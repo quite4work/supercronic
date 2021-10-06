@@ -102,15 +102,15 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 	}
 
 	if replacing {
-		cmdDoneCh := make(chan struct{})
-		var pid int = cmd.Process.Pid
+		ctx, cancel := context.WithDeadline(context.Background(), nextRun)
+		defer cancel()
+		pid := cmd.Process.Pid
 		go func() {
 			// Kill command and its subprocesses after timeout.
-			<-time.After(time.Until(nextRun))
-			syscall.Kill(-pid, syscall.SIGKILL)
-		}()
-		defer func() {
-			close(cmdDoneCh)
+			<-ctx.Done()
+			if ctx.Err() == context.DeadlineExceeded {
+				syscall.Kill(-pid, syscall.SIGKILL)
+			}
 		}()
 	}
 
