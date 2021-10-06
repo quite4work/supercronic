@@ -105,17 +105,12 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 		cmdDoneCh := make(chan struct{})
 		var pid int = cmd.Process.Pid
 		go func() {
-			select {
-			// Kill command and its subprocesses when command is canceled.
-			case <-time.After(time.Until(nextRun)):
-				syscall.Kill(-pid, syscall.SIGKILL)
-				<-cmdDoneCh
-			// Do nothing if command has already finished.
-			case <-cmdDoneCh:
-			}
+			// Kill command and its subprocesses after timeout.
+			<-time.After(time.Until(nextRun))
+			syscall.Kill(-pid, syscall.SIGKILL)
 		}()
 		defer func() {
-			cmdDoneCh <- struct{}{}
+			close(cmdDoneCh)
 		}()
 	}
 
