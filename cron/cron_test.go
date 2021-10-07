@@ -150,8 +150,7 @@ func TestRunJob(t *testing.T) {
 		label := fmt.Sprintf("RunJob(%q)", tt.command)
 		logger, channel := newTestLogger()
 
-		cmdCtx := context.Background()
-		err := runJob(cmdCtx, tt.context, tt.command, logger, false)
+		err := runJob(tt.context, tt.command, logger, false, time.Now(), false)
 		if tt.success {
 			assert.Nil(t, err, label)
 		} else {
@@ -267,6 +266,62 @@ func TestStartJobRunsJob(t *testing.T) {
 	wg.Wait()
 }
 
+func TestStartJobReplacesPreviousJobs(t *testing.T) {
+	job := crontab.Job{
+		CrontabLine: crontab.CrontabLine{
+			Expression: &testExpression{2 * time.Second},
+			Schedule:   "always!",
+			Command:    "sleep 100",
+		},
+		Position: 1,
+	}
+
+	var wg sync.WaitGroup
+	ctx, cancel := context.WithCancel(context.Background())
+
+	logger, channel := newTestLogger()
+
+	StartJob(&wg, &basicContext, &job, ctx, logger, false, true, false, &PROM_METRICS)
+
+	select {
+	case entry := <-channel:
+		assert.Regexp(t, regexp.MustCompile("job will run next"), entry.Message)
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for schedule")
+	}
+
+	select {
+	case entry := <-channel:
+		assert.Regexp(t, regexp.MustCompile("starting"), entry.Message)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for start")
+	}
+
+	select {
+	case entry := <-channel:
+		assert.Regexp(t, regexp.MustCompile("replacing job"), entry.Message)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for job replace warning")
+	}
+
+	select {
+	case entry := <-channel:
+		assert.Regexp(t, regexp.MustCompile("killed"), entry.Message)
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for job kill")
+	}
+
+	select {
+	case entry := <-channel:
+		assert.Regexp(t, regexp.MustCompile("job will run next"), entry.Message)
+	case <-time.After(time.Second):
+		t.Fatalf("timed out waiting for schedule of the second job")
+	}
+
+	cancel()
+	wg.Wait()
+}
+
 func TestStartFuncWaitsForCompletion(t *testing.T) {
 	// We use startFunc to start a function, wait for it to start, then
 	// tell the whole thing to exit, and verify that it waits for the
@@ -282,7 +337,7 @@ func TestStartFuncWaitsForCompletion(t *testing.T) {
 	ctxStep1, step1Done := context.WithCancel(context.Background())
 	ctxStep2, step2Done := context.WithCancel(context.Background())
 
-	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
+	testFn := func(t0 time.Time, jobLogger *logrus.Entry, replacing bool) {
 		step1Done()
 		<-ctxStep2.Done()
 	}
@@ -330,7 +385,7 @@ func TestStartFuncDoesNotRunOverlappingJobs(t *testing.T) {
 	ctxStartFunc, cancelStartFunc := context.WithCancel(context.Background())
 	ctxAllDone, allDone := context.WithCancel(context.Background())
 
-	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
+	testFn := func(t0 time.Time, jobLogger *logrus.Entry, replacing bool) {
 		testChan <- nil
 		<-ctxAllDone.Done()
 	}
@@ -369,7 +424,7 @@ func TestStartFuncRunsOverlappingJobs(t *testing.T) {
 	ctxStartFunc, cancelStartFunc := context.WithCancel(context.Background())
 	ctxAllDone, allDone := context.WithCancel(context.Background())
 
-	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
+	testFn := func(t0 time.Time, jobLogger *logrus.Entry, replacing bool) {
 		testChan <- nil
 		<-ctxAllDone.Done()
 	}
@@ -381,51 +436,6 @@ func TestStartFuncRunsOverlappingJobs(t *testing.T) {
 		case <-testChan:
 		case <-time.After(time.Second):
 			t.Fatalf("fn instances did not overlap")
-		}
-	}
-
-	cancelStartFunc()
-	allDone()
-
-	wg.Wait()
-}
-
-func TestStartFuncRunsReplacingJobs(t *testing.T) {
-	// We kick off a bunch of functions that never terminate, and expect to
-	// see that jobs are replaced sequentially.
-
-	expr := &testExpression{10 * time.Millisecond}
-
-	testChan := make(chan int, TEST_CHANNEL_BUFFER_SIZE)
-	iterChan := make(chan int, TEST_CHANNEL_BUFFER_SIZE)
-	iterChan <- -1
-
-	var wg sync.WaitGroup
-	logger, _ := newTestLogger()
-
-	ctxStartFunc, cancelStartFunc := context.WithCancel(context.Background())
-	ctxAllDone, allDone := context.WithCancel(context.Background())
-
-	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
-		iteration := <-iterChan
-		select {
-		case <-cmdCtx.Done():
-			iterChan <- iteration + 1
-			testChan <- iteration + 1
-		case <-ctxAllDone.Done():
-		}
-	}
-
-	startFunc(&wg, ctxStartFunc, logger, false, true, expr, time.Local, testFn)
-
-	for i := 0; i < 5; i++ {
-		select {
-		case iteration := <-testChan:
-			if iteration != i {
-				t.Fatalf("fn instances are not replaced sequentially")
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("fn instances were not replaced")
 		}
 	}
 
@@ -452,7 +462,7 @@ func TestStartFuncUsesTz(t *testing.T) {
 
 	it := 0
 
-	testFn := func(cmdCtx context.Context, t0 time.Time, jobLogger *logrus.Entry) {
+	testFn := func(t0 time.Time, jobLogger *logrus.Entry, replacing bool) {
 		testChan <- t0.Location()
 		it += 1
 
