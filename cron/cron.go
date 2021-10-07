@@ -226,7 +226,7 @@ func startFunc(
 				fn(nextRun, jobLogger, replacing)
 			}
 
-			if overlapping || replacing {
+			if overlapping {
 				go runThisJob(cronIteration, nextRun)
 			} else {
 				runThisJob(cronIteration, nextRun)
