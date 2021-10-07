@@ -104,20 +104,17 @@ func runJob(cronCtx *crontab.Context, command string, jobLogger *logrus.Entry, p
 	if replacing {
 		ctx, cancel := context.WithDeadline(context.Background(), nextRun)
 		defer cancel()
-		cmdPid := cmd.Process.Pid
-		go func() {
-			// Kill command and its subprocesses
-			// if the deadline is exceeded.
+		go func(pid int) {
+			// Kill command and its sub-processes once the deadline is exceeded.
 			<-ctx.Done()
 			if ctx.Err() == context.DeadlineExceeded {
-				// Negative number tells to kill process group.
-				// By convention PGID of process group equals
-				// to the PID of the group leader.
-				// Command process is the first member of the
-				// process group and is the group leader.
-				syscall.Kill(-cmdPid, syscall.SIGKILL)
+				// Negative number tells to kill the whole process group.
+				// By convention PGID of process group equals to the PID of the
+				// group leader, so the command process is the first member of
+				// the process group and is the group leader.
+				syscall.Kill(-pid, syscall.SIGKILL)
 			}
-		}()
+		}(cmd.Process.Pid)
 	}
 
 	var wg sync.WaitGroup
