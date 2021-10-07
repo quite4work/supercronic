@@ -315,7 +315,7 @@ func TestStartJobReplacesPreviousJobs(t *testing.T) {
 	case entry := <-channel:
 		assert.Regexp(t, regexp.MustCompile("job will run next"), entry.Message)
 	case <-time.After(time.Second):
-		t.Fatalf("timed out waiting for schedule of the second job")
+		t.Fatalf("timed out waiting for schedule of the second job iteration")
 	}
 
 	cancel()
